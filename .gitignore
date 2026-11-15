@@ -1,0 +1,32 @@
+# Footage and frames: may contain minors, never commit
+data/raw/*
+data/frames/*
+!data/raw/.gitkeep
+!data/frames/.gitkeep
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Model weights and training runs
+models/*
+!models/.gitkeep
+*.pt
+*.onnx
+runs/
+debug/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Secrets and local settings
+.env
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db

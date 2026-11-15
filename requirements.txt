@@ -1,0 +1,18 @@
+# Core CV
+rfdetr             # RF-DETR detection (Nano/Small/Medium/Large are Apache-2.0)
+trackers           # ByteTrack / BoT-SORT (Roboflow), moved out of supervision
+supervision        # video I/O, annotation, detection utilities
+opencv-python
+numpy
+
+# Data / analysis
+pandas
+scikit-learn
+matplotlib
+tqdm
+
+# Dashboard and notebooks
+streamlit
+jupyter
+
+# Pin exact versions once the pipeline works: pip freeze > requirements.lock.txt
