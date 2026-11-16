@@ -72,6 +72,10 @@ Next steps:
 - Resolve ground truth (hand-charted stats for at least one game) before any accuracy claim.
 - Test on more than one clip.
 
+**Later on 2026-11-15: default tracker decided (resolves the open decision above).** The default is now ByteTrack preset A0 (task 002 Step 0). BoT-SORT and all presets stay selectable via `--tracker botsort` and `--preset`. The reason is evidence: BoT-SORT's tracker cost is about 17 to 19 times A0's per frame, with no consistent gain in IDs and fewer long-lived IDs by presence. CMC showed no signal (B0 vs B1).
+
+A1 (43 IDs, the only count below 45) was rejected after a manual merge check by the student, on the annotated video and crops, of A1's reconnections after gaps over 1 s (`runs/task001_eval/A1/xbotgo_tracks.csv`). Two of three are wrong merges: ID 28 joins a blue-jersey player (frame 666) to a different white-shirt player (frame 709), and ID 20 joins a white-jersey player (frame 500) to a spectator by the door (frame 538). ID 0 (frames 159 to 192) is probably correct. So A1's 43 is partly an artifact of merging different people. This is the failure mode the "fewer IDs is not automatically better" caveat in `eval/reports/2026-11-15-botsort-vs-bytetrack.md` predicted, and it is why task 002 makes a merge check a required part of its eval.
+
 ## 2026-11-14
 - Pivoted from ultimate frisbee to basketball (youth shot & stat tracking).
 - Set up project structure and Claude Code agent team (architect on Fable; researcher, model-builder, evaluator on Sonnet; reviewer on Opus; data-engineer and report-writer on Haiku).

@@ -6,7 +6,7 @@ Two modes:
   - Fine-tuned (--weights): your own trained RF-DETR checkpoint with the classes
     player / referee / ball / rim.
 
-Tracking uses BoT-SORT (default) or ByteTrack from Roboflow's `trackers` package;
+Tracking uses ByteTrack (default, preset A0) or BoT-SORT from Roboflow's `trackers` package;
 settings live in src/tracking/factory.py (PRESETS).
 
 Outputs:
@@ -137,7 +137,7 @@ def run(
     threshold: float,
     max_seconds: float | None,
     show: bool = False,
-    settings: TrackerSettings = PRESETS[DEFAULT_PRESET["botsort"]],
+    settings: TrackerSettings = PRESETS[DEFAULT_PRESET["bytetrack"]],
     cached: list[sv.Detections] | None = None,
     write_video: bool = True,
     save_cache_meta: tuple[Path, dict] | None = None,
@@ -268,7 +268,7 @@ def main() -> None:
     p.add_argument("--trust-checkpoint", action="store_true", help="allow full loading of a checkpoint you trust (your own Roboflow download)")
     p.add_argument("--threshold", type=float, default=0.4, help="detection confidence threshold")
     p.add_argument("--max-seconds", type=float, default=None, help="only process the first N seconds")
-    p.add_argument("--tracker", choices=["bytetrack", "botsort"], default="botsort", help="tracker; picks its default preset (bytetrack=A0, botsort=B1)")
+    p.add_argument("--tracker", choices=["bytetrack", "botsort"], default="bytetrack", help="tracker; picks its default preset (bytetrack=A0 [default], botsort=B1)")
     p.add_argument("--preset", choices=sorted(PRESETS), default=None, help="explicit tracker grid row (see src/tracking/factory.py); overrides --tracker")
     p.add_argument("--save-detections", nargs="?", const="auto", default=None, metavar="PATH", help="save raw detections to a .npz (no PATH: runs/cache/<video>__w<sha8 of weights>__<model>__thr<X>.npz)")
     p.add_argument("--detections", type=Path, default=None, metavar="PATH", help="replay detections from a cache .npz instead of running the model")

@@ -38,7 +38,7 @@ Generated table (all columns, including both lifetimes): `eval/reports/2026-11-1
 B0 and B1 differ only in `enable_cmc`, so this is the only pair that isolates CMC. B0 (no CMC) = 50 IDs, B1 (CMC) = 49. A one-ID difference on one clip is within noise: **CMC did not measurably help on this clip.** Short-lived IDs by span went the wrong way (14 to 15); by presence they improved (20 to 18), so there is no consistent CMC signal. The camera-pan benefit that motivated the task is not visible in these metrics.
 
 ## Verdict
-BoT-SORT is **not better than ByteTrack here**. The best BoT-SORT preset (B3, 45) only ties the default ByteTrack (A0, 45), and BoT-SORT at matching buffers is equal or worse (1 s: 49 to 50 vs 45; 3 s: 45 to 46 vs 43). It also has fewer long-lived IDs by presence (15 to 19 vs 21; by span 19 to 24 vs 24). The task criterion "fewer than 43 IDs" is **not met** by any BoT-SORT preset (best = 45), and the 43 target itself was measured on a different checkpoint. Only A1 (ByteTrack, 3 s buffer) reaches 43, a ByteTrack-only change.
+BoT-SORT is **not better than ByteTrack here**. The best BoT-SORT preset (B3, 45) only ties the default ByteTrack (A0, 45), and BoT-SORT at matching buffers is equal or worse (1 s: 49 to 50 vs 45; 3 s: 45 to 46 vs 43). It also has fewer long-lived IDs by presence (15 to 19 vs 21; by span 19 to 24 vs 24). The task criterion "fewer than 43 IDs" is **not met** by any BoT-SORT preset (best = 45), and the brief's 43 target (older checkpoint) itself was measured on a different checkpoint. Only A1 (ByteTrack, 3 s buffer) reaches 43, a ByteTrack-only change. That 43 is partly an artifact of wrong merges (see Merge check), so it is not an endorsement of A1.
 
 Best read on why (hypotheses, not tested):
 - The dominant fragmentation is probably not camera motion. 14 to 19 IDs flicker player/referee, and the detector is thresholded at 0.4 with many low-confidence boxes, so tracks break from detections appearing and vanishing. CMC cannot fix that.
@@ -49,8 +49,21 @@ Best read on why (hypotheses, not tested):
 ## Caveat: fewer IDs is not automatically better
 Two players merging into one persistent ID would lower every metric in the table while making tracking worse. Nothing here detects that. Longer buffers (A1, B2 to B4) raise that risk. The student should watch the annotated video before trusting any ID count.
 
+## Merge check
+Added after the fact. **These findings are the student's own, from a manual crop check of A1's reconnections after gaps over 1 s in `runs/task001_eval/A1/xbotgo_tracks.csv`. The evaluator did not measure them and has not independently verified them.**
+
+| A1 ID | Frames | Student's reading |
+|---|---|---|
+| 28 | 666 -> 709 | Blue-jersey player to a different white-shirt kid. **Wrong merge.** |
+| 20 | 500 -> 538 | White-jersey player to a spectator by the door. **Wrong merge.** |
+| 0 | 159 -> 192 | Similar white/red jersey. Probably correct. |
+
+Two of A1's three long-gap reconnections are wrong merges (n = 3, one clip, so this is a small sample, but the failure is qualitative). The "fewer IDs is not automatically better" caveat above was borne out: A1 reached 43 partly by merging different people. The measured ID counts are unchanged; what changes is how to read them.
+
+Methodological lesson: a lower unique-ID count cannot be read as better tracking without a merge check, and no metric in the table above detects a merge. This is why task 002 makes the merge check a required part of the eval. The same check has not been run on B2 to B4 (also 3 s buffers), so their counts carry the same unresolved risk.
+
 ## Recommendation
-Rule: simplest preset within 10% of the fewest IDs (43, so <= 47.3 qualifies: A0, A1, B2, B3). **Winner: A0 (ByteTrack, defaults)**, the simplest. A1 is nominally best (43) and is a one-parameter change; consider it if the video shows no merged players. Do not switch the default to BoT-SORT on this evidence. Real conclusions need labelled tracks (even about 10 s of hand-labelled IDs would allow IDF1) and more than one clip.
+Rule: simplest preset within 10% of the fewest IDs (43, so <= 47.3 qualifies: A0, A1, B2, B3). **Winner: A0 (ByteTrack, defaults)**, the simplest. A1 is **no longer a candidate on its ID count**: the merge check above found that its 43 is partly an artifact of wrong merges. **A0 remains the recommendation**, now on stronger evidence than the simplicity tie-break alone. Do not switch the default to BoT-SORT on this evidence. Real conclusions need labelled tracks (even about 10 s of hand-labelled IDs would allow IDF1) and more than one clip.
 
 Annotated video of the winner (same CSV as the no-video run, verified byte-identical): `c:\Users\Minim\Desktop\Startup VS Code\runs\task001_eval_video\A0\xbotgo_tracked.mp4`
 
