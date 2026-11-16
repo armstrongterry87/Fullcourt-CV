@@ -1,7 +1,7 @@
 # Core CV
 rfdetr             # RF-DETR detection (Nano/Small/Medium/Large are Apache-2.0)
-trackers           # ByteTrack / BoT-SORT (Roboflow), moved out of supervision
-supervision        # video I/O, annotation, detection utilities
+trackers==2.7.0           # ByteTrack / BoT-SORT (Roboflow), moved out of supervision
+supervision==0.31.7        # video I/O, annotation, detection utilities
 opencv-python
 numpy
 
