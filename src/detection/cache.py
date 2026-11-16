@@ -16,7 +16,9 @@ import supervision as sv
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CACHE_DIR = REPO_ROOT / "runs" / "cache"  # anchored to the repo, not the process cwd
 
-CHECKED_KEYS = ("video_stem", "fps", "weights_name", "weights_sha256", "model_size", "threshold", "classes")
+# Strict equality keys. `threshold` is checked separately: it is the detection floor, and a cache
+# made at a lower floor can serve any higher request (never the reverse).
+CHECKED_KEYS = ("video_stem", "fps", "weights_name", "weights_sha256", "model_size", "classes")
 
 
 def weights_sha256(weights: Path | None) -> str | None:
@@ -79,13 +81,17 @@ def load_detections(path: Path, expected: dict, n_frames_needed: int) -> list[sv
     """Load cached detections for the first `n_frames_needed` frames.
 
     Raises ValueError if the cache was made from a different video, fps, weights
-    content, model size, threshold or class list, or holds fewer frames than needed.
+    content, model size or class list, if its detection floor is higher than the
+    requested floor, or if it holds fewer frames than needed.
     """
     z = np.load(path, allow_pickle=False)
     meta = json.loads(str(z["meta"]))
     for key in CHECKED_KEYS:
         if meta.get(key) != expected.get(key):
             raise ValueError(f"Detection cache {path} does not match this run: {key} is {meta.get(key)!r} in the cache but {expected.get(key)!r} now.")
+    cache_floor, requested_floor = meta.get("threshold"), expected.get("threshold")
+    if cache_floor is None or requested_floor is None or cache_floor > requested_floor:
+        raise ValueError(f"Detection cache {path} has detection floor {cache_floor!r}, above the requested floor {requested_floor!r}; re-run detection at the lower floor.")
     if meta["n_frames"] < n_frames_needed:
         raise ValueError(f"Detection cache {path} holds {meta['n_frames']} frames but {n_frames_needed} are needed.")
     # read each array once (NpzFile decompresses on every lookup)

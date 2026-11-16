@@ -5,7 +5,7 @@ This is a **self-consistency comparison, not an accuracy measurement.** `data/gr
 ## What was evaluated
 - Clip: `data/raw/xbotgo.mp4`, 1 clip, 719 frames, 23.951 fps (30 s), panning camera. **Sample size is one 30 s clip, no held-out games. Treat differences of a few IDs as noise.**
 - Detector: `models/weights.pt` (fine-tuned RF-DETR Small), threshold 0.40. Detections were cached once (`runs/cache/xbotgo__wfc2f7c4e__small__thr0.40.npz`) and replayed for every preset, so all presets see identical detections (detection is deterministic run to run, verified by the caller).
-- Code: `scripts/baseline_track.py` and `src/tracking/factory.py` `PRESETS` as of 2026-11-15 (measured from the working tree with changes uncommitted, so there is no commit hash yet; files measured: `scripts/baseline_track.py`, `src/tracking/factory.py`, `src/detection/cache.py`; tie this run to a commit once the student commits). Metrics script: `eval/track_consistency.py`. Raw outputs: `runs/task001_eval/<preset>/`. Each preset has its own directory; no collisions.
+- Code: `scripts/baseline_track.py` and `src/tracking/factory.py` `PRESETS` as of 2026-11-15 (measured from the working tree just before commit `a9144a9`; files measured: `scripts/baseline_track.py`, `src/tracking/factory.py`, `src/detection/cache.py`. Note `a9144a9` and its child `abbfbe4` share the same commit message but are different commits; `abbfbe4` carries Step 0). Metrics script: `eval/track_consistency.py`. Raw outputs: `runs/task001_eval/<preset>/`. Each preset has its own directory; no collisions.
 
 ## Baseline correction
 The task brief states ByteTrack = 43 IDs / 31.2% ball. **That is not reproducible.** `models/weights.pt` was replaced at 19:18:50 and the brief's table came from the older checkpoint. With the current weights, A0 gives **45 IDs / 28.8% ball**, and the A0 CSV is byte-identical to a pre-change run (`runs/finetuned/xbotgo_tracks.csv`). All comparisons here use 45. (Gate passed: A0 = 45 / 28.8%. Sanity: B0 = 50, B1 = 49 reproduced.)
@@ -47,10 +47,10 @@ Best read on why (hypotheses, not tested):
 - The camera pan may be too slow or small for CMC to matter, or sparse optical flow may fail on a gym floor with sparse texture. Unverified.
 
 ## Caveat: fewer IDs is not automatically better
-Two players merging into one persistent ID would lower every metric in the table while making tracking worse. Nothing here detects that. Longer buffers (A1, B2 to B4) raise that risk. The student should watch the annotated video before trusting any ID count.
+Two players merging into one persistent ID would lower every metric in the table while making tracking worse. Nothing here detects that. Longer buffers (A1, B2 to B4) raise that risk. The annotated video should be reviewed by hand before trusting any ID count.
 
 ## Merge check
-Added after the fact. **These findings are the student's own, from a manual crop check of A1's reconnections after gaps over 1 s in `runs/task001_eval/A1/xbotgo_tracks.csv`. The evaluator did not measure them and has not independently verified them.**
+Added after the fact. **These findings come from a manual crop check of A1's reconnections after gaps over 1 s in `runs/task001_eval/A1/xbotgo_tracks.csv`. They were produced by hand, not measured by the evaluator, and have not been independently verified.**
 
 | A1 ID | Frames | Student's reading |
 |---|---|---|

@@ -1,0 +1,1 @@
+pytest   # MIT licence; tests only, not needed to run the pipeline

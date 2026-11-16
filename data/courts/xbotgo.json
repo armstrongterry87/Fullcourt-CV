@@ -1,0 +1,28 @@
+{
+  "video_stem": "xbotgo",
+  "frame_index": 430,
+  "frame_width": 1280,
+  "frame_height": 720,
+  "polygon_px": [
+    [
+      300.0,
+      330.0
+    ],
+    [
+      980.0,
+      330.0
+    ],
+    [
+      1200.0,
+      700.0
+    ],
+    [
+      80.0,
+      700.0
+    ]
+  ],
+  "valid_frames": [
+    359,
+    503
+  ]
+}

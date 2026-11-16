@@ -28,7 +28,6 @@ Install first:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import csv
 import json
 import sys
@@ -44,13 +43,12 @@ import supervision as sv
 
 # imports below must follow the sys.path bootstrap above (script is run as a file, not a package)
 from src.detection.cache import cache_path, load_detections, make_meta, read_meta, save_detections, weights_sha256  # noqa: E402
+from src.court.polygon import ConfigError, check_resolution, check_video_stem, court_keep_mask, load_court  # noqa: E402
+from src.detection.filtering import BALL_NAMES, PLAYER_NAMES, REFEREE_NAMES, RIM_NAMES, apply_class_thresholds  # noqa: E402
 from src.tracking.factory import DEFAULT_PRESET, PRESETS, PlayerTracker, TrackerSettings  # noqa: E402
+from src.tracking.roles import RoleTally, rewrite_with_roles  # noqa: E402
 
-# Class names are matched by meaning, so the same code works for COCO and fine-tuned models.
-PLAYER_NAMES = {"person", "player"}
-REFEREE_NAMES = {"referee"}
-BALL_NAMES = {"sports ball", "ball"}
-RIM_NAMES = {"rim"}
+CSV_HEADER = ["frame", "time_s", "class", "track_id", "conf", "x1_px", "y1_px", "x2_px", "y2_px"]
 
 
 def load_model(size: str, weights: Path | None = None, trust_checkpoint: bool = False):
@@ -128,9 +126,72 @@ def pick(detections: sv.Detections, names: np.ndarray, wanted: set[str]) -> sv.D
     return detections[np.isin(names, list(wanted))]
 
 
+def id_labels(dets: sv.Detections, prefix: str = "") -> list[str]:
+    """Text label per detection: '#<track id>' (with optional prefix), or just the prefix."""
+    if dets.tracker_id is None:
+        return [prefix.strip()] * len(dets)
+    return [f"{prefix}#{int(t)}" if t >= 0 else prefix.strip() for t in dets.tracker_id]
+
+
+class Annotator:
+    """Draws players, referees, rim and ball onto a frame."""
+
+    def __init__(self, fps: float) -> None:
+        self.box = sv.BoxAnnotator(thickness=2)
+        self.ref_box = sv.BoxAnnotator(thickness=2, color=sv.Color.YELLOW)
+        self.rim_box = sv.BoxAnnotator(thickness=2, color=sv.Color.GREEN)
+        self.label = sv.LabelAnnotator(text_scale=0.5, text_padding=3)
+        self.trace = sv.TraceAnnotator(trace_length=int(fps))  # ~1 second trail
+        self.ball_marker = sv.TriangleAnnotator(base=18, height=16)
+
+    def draw(self, frame: np.ndarray, players, refs, ball, rims) -> np.ndarray:
+        """Return an annotated copy of `frame`."""
+        out = self.trace.annotate(frame.copy(), players)
+        out = self.box.annotate(out, players)
+        out = self.label.annotate(out, players, id_labels(players))
+        out = self.ref_box.annotate(out, refs)
+        out = self.label.annotate(out, refs, id_labels(refs, "REF "))
+        out = self.rim_box.annotate(out, rims)
+        return self.ball_marker.annotate(out, ball)
+
+
+def render_video(video_path: Path, final_csv: Path, out_video: Path, max_frames: int | None = None) -> None:
+    """Second pass: draw the finished CSV, so the video shows exactly what the eval counts.
+
+    Players and referees are drawn by `role_track` (one role per track).
+    """
+    info = sv.VideoInfo.from_video_path(str(video_path))
+    by_frame: dict[int, list[dict]] = {}
+    with open(final_csv, newline="") as f:
+        for r in csv.DictReader(f):
+            by_frame.setdefault(int(r["frame"]), []).append(r)
+    if by_frame and "role_track" not in next(iter(by_frame.values()))[0]:
+        raise SystemExit(f"{final_csv} has no role_track column (made before task 002); re-run to regenerate it.")
+    last = (max(by_frame) if by_frame else -1) if max_frames is None else max_frames - 1
+    ann = Annotator(float(info.fps))
+
+    def dets(rows: list[dict]) -> sv.Detections:
+        if not rows:
+            return sv.Detections.empty()
+        return sv.Detections(
+            xyxy=np.array([[r["x1_px"], r["y1_px"], r["x2_px"], r["y2_px"]] for r in rows], dtype=np.float32),
+            class_id=np.zeros(len(rows), dtype=int),
+            tracker_id=np.array([int(r["track_id"]) for r in rows], dtype=int),
+        )
+
+    out_video.parent.mkdir(parents=True, exist_ok=True)
+    with sv.VideoSink(str(out_video), info) as sink:
+        for i, frame in enumerate(sv.get_video_frames_generator(str(video_path))):
+            if i > last:
+                break
+            rows = by_frame.get(i, [])
+            role = lambda want: dets([r for r in rows if r["class"] in ("player", "referee") and r["role_track"] == want])  # noqa: E731
+            cls = lambda want: dets([r for r in rows if r["class"] == want])  # noqa: E731
+            sink.write_frame(ann.draw(frame, role("player"), role("referee"), cls("ball"), cls("rim")))
+
+
 def run(
     video_path: Path,
-    out_video: Path,
     out_csv: Path,
     model,
     namer,
@@ -139,36 +200,48 @@ def run(
     show: bool = False,
     settings: TrackerSettings = PRESETS[DEFAULT_PRESET["bytetrack"]],
     cached: list[sv.Detections] | None = None,
-    write_video: bool = True,
     save_cache_meta: tuple[Path, dict] | None = None,
+    person_threshold: float | None = None,
+    ball_threshold: float | None = None,
+    rim_threshold: float | None = None,
+    court=None,
+    court_margin_px: float = 20.0,
+    allow_court_stem_mismatch: bool = False,
 ) -> dict:
-    """Detect, track and annotate every frame. Returns a short summary.
+    """Detect (or replay), threshold per class, filter, track, and write the CSV.
 
-    With show=True, a window plays the annotated frames live (press q to stop early).
+    `threshold` is the detection floor and the rim threshold; person/ball thresholds default
+    to it. Per-class thresholds are applied on both live and replay paths, so the cache stays
+    raw. The annotated video is made afterwards by `render_video`. With show=True a window
+    plays a per-frame-label live preview (press q to stop early).
     """
+    person_threshold = threshold if person_threshold is None else person_threshold
+    ball_threshold = threshold if ball_threshold is None else ball_threshold
+    rim_threshold = threshold if rim_threshold is None else rim_threshold
     info = sv.VideoInfo.from_video_path(str(video_path))
     fps = float(info.fps)
     max_frames = int(max_seconds * fps) if max_seconds else info.total_frames
     if cached is not None:
         max_frames = min(max_frames, len(cached))
+    if court is not None:
+        check_resolution(court, info.resolution_wh[0], info.resolution_wh[1])
+        if not allow_court_stem_mismatch:
+            check_video_stem(court, video_path.stem)
 
     tracker = PlayerTracker(settings, fps)
     raw_per_frame: list[sv.Detections] = []
     track_secs = 0.0
-    box = sv.BoxAnnotator(thickness=2)
-    ref_box = sv.BoxAnnotator(thickness=2, color=sv.Color.YELLOW)
-    rim_box = sv.BoxAnnotator(thickness=2, color=sv.Color.GREEN)
-    label = sv.LabelAnnotator(text_scale=0.5, text_padding=3)
-    trace = sv.TraceAnnotator(trace_length=int(fps))  # ~1 second trail
-    ball_marker = sv.TriangleAnnotator(base=18, height=16)
+    ann = Annotator(fps) if show else None
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    frames_done, ball_frames, player_ids = 0, 0, set()
-    sink_cm = sv.VideoSink(str(out_video), info) if write_video else contextlib.nullcontext()
+    tmp_csv = out_csv.with_name(out_csv.name + ".tmp")
+    frames_done, ball_frames, ball_multi = 0, 0, 0
+    tally = RoleTally()
+    frame_label_player_ids: set[int] = set()
 
-    with sink_cm as sink, open(out_csv, "w", newline="") as f:
+    with open(tmp_csv, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["frame", "time_s", "class", "track_id", "conf", "x1_px", "y1_px", "x2_px", "y2_px"])
+        writer.writerow(CSV_HEADER)
 
         for i, frame in enumerate(sv.get_video_frames_generator(str(video_path))):
             if i >= max_frames:
@@ -181,14 +254,21 @@ def run(
             if save_cache_meta is not None:
                 raw_per_frame.append(detections)
             names = np.array(class_names(detections, namer))
+            detections, names = apply_class_thresholds(detections, names, person_threshold, ball_threshold, rim_threshold)
 
             # players and referees are tracked together (both are people moving on court)
             people = pick(detections, names, PLAYER_NAMES | REFEREE_NAMES)
             people_names = names[np.isin(names, list(PLAYER_NAMES | REFEREE_NAMES))] if len(detections) else names
             ball = pick(detections, names, BALL_NAMES)
             rims = pick(detections, names, RIM_NAMES)
+            ball_multi += int(len(ball) > 1)  # 2+ candidates, after thresholds, before the argmax dedup
             if len(ball) > 1:  # keep only the most confident ball
                 ball = ball[[int(np.argmax(ball.confidence))]]
+
+            if court is not None and len(people):
+                # people only, before the tracker, so off-court spectators never start tracks
+                keep = court_keep_mask(people.xyxy, court, i, court_margin_px)
+                people, people_names = people[keep], people_names[keep]
 
             if len(people):
                 people.data["class_name"] = people_names
@@ -201,7 +281,7 @@ def run(
                 else np.zeros(len(people), dtype=bool)
             )
             players, refs = people[~is_ref], people[is_ref]
-            player_ids.update(int(t) for t in players.tracker_id if t is not None and t >= 0)
+            frame_label_player_ids.update(int(t) for t in players.tracker_id if t is not None and t >= 0)
             ball_frames += int(len(ball) > 0)
 
             t = i / fps
@@ -211,29 +291,15 @@ def run(
                     tid = int(dets.tracker_id[k]) if dets.tracker_id is not None else -1
                     conf = float(dets.confidence[k]) if dets.confidence is not None else ""
                     writer.writerow([i, f"{t:.3f}", d_class, tid, conf, f"{x1:.1f}", f"{y1:.1f}", f"{x2:.1f}", f"{y2:.1f}"])
+                    tally.add(tid, d_class, conf if isinstance(conf, float) else 0.0)
 
-            def id_labels(dets: sv.Detections, prefix: str = "") -> list[str]:
-                if dets.tracker_id is None:
-                    return [prefix.strip()] * len(dets)
-                return [f"{prefix}#{int(t)}" if t >= 0 else prefix.strip() for t in dets.tracker_id]
-
-            if sink is not None or show:
-                annotated = trace.annotate(frame.copy(), players)
-                annotated = box.annotate(annotated, players)
-                annotated = label.annotate(annotated, players, id_labels(players))
-                annotated = ref_box.annotate(annotated, refs)
-                annotated = label.annotate(annotated, refs, id_labels(refs, "REF "))
-                annotated = rim_box.annotate(annotated, rims)
-                annotated = ball_marker.annotate(annotated, ball)
-            if sink is not None:
-                sink.write_frame(annotated)
             frames_done += 1
             print(f"  frame {frames_done}/{max_frames}", end="\r", flush=True)
 
             if show:
                 import cv2
 
-                cv2.imshow("Basketball CV - press q to stop", annotated)
+                cv2.imshow("Basketball CV - press q to stop (per-frame labels)", ann.draw(frame, players, refs, ball, rims))
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
@@ -243,6 +309,10 @@ def run(
         cv2.destroyAllWindows()
     print()
 
+    roles = tally.roles()
+    rewrite_with_roles(tmp_csv, out_csv, roles)
+    tmp_csv.unlink()
+
     if save_cache_meta is not None:
         path, meta = save_cache_meta
         save_detections(path, raw_per_frame, {**meta, "n_frames": frames_done, "fps": fps})
@@ -250,8 +320,14 @@ def run(
     return {
         "frames": frames_done,
         "fps": fps,
-        "unique_player_ids": len(player_ids),
+        "unique_player_ids": len(frame_label_player_ids),
+        "unique_player_ids_by_role": sum(1 for r in roles.values() if r == "player"),
+        "tracks_with_both_labels": tally.tracks_with_both_labels(),
         "ball_seen_pct": round(100 * ball_frames / max(frames_done, 1), 1),
+        "ball_multi_candidate_frames": ball_multi,
+        "person_threshold": person_threshold,
+        "ball_threshold": ball_threshold,
+        "rim_threshold": rim_threshold,
         "tracker_ms_per_frame": round(1000 * track_secs / max(frames_done, 1), 3),
         "tracker_kwargs": tracker.kwargs,
         "tracker_resolved_config": tracker.resolved_kwargs,
@@ -266,7 +342,13 @@ def main() -> None:
     p.add_argument("--weights", type=Path, default=None, help="fine-tuned RF-DETR checkpoint, e.g. models/weights.pt")
     p.add_argument("--classes", default="ball,player,referee,rim", help="fine-tuned class names in alphabetical order, comma-separated")
     p.add_argument("--trust-checkpoint", action="store_true", help="allow full loading of a checkpoint you trust (your own Roboflow download)")
-    p.add_argument("--threshold", type=float, default=0.4, help="detection confidence threshold")
+    # Future work: a separate --rim-threshold and --floor flag (today --threshold is both the rim threshold and the floor fallback).
+    p.add_argument("--threshold", type=float, default=0.4, help="rim threshold, and the default for --person-threshold / --ball-threshold")
+    p.add_argument("--person-threshold", type=float, default=None, help="min confidence for players/referees (default: --threshold)")
+    p.add_argument("--ball-threshold", type=float, default=None, help="min confidence for the ball (default: --threshold)")
+    p.add_argument("--court", type=Path, default=None, help="court polygon JSON (see src/court/polygon.py); drops people whose feet are outside it")
+    p.add_argument("--allow-court-stem-mismatch", action="store_true", help="allow a court polygon drawn on a different video file (same camera position)")
+    p.add_argument("--court-margin-px", type=float, default=20.0, help="pixels outside the court polygon still kept (native pixels)")
     p.add_argument("--max-seconds", type=float, default=None, help="only process the first N seconds")
     p.add_argument("--tracker", choices=["bytetrack", "botsort"], default="bytetrack", help="tracker; picks its default preset (bytetrack=A0 [default], botsort=B1)")
     p.add_argument("--preset", choices=sorted(PRESETS), default=None, help="explicit tracker grid row (see src/tracking/factory.py); overrides --tracker")
@@ -296,7 +378,10 @@ def main() -> None:
         print("Weights file not found; replaying without checking the checkpoint hash.")
     elif args.detections is not None:
         sha = weights_sha256(args.weights)  # checkpoint present: verify it matches the cache
-    meta = make_meta(args.video, max_frames, fps, args.weights, args.model, args.threshold, class_list, sha)
+    # detection floor = lowest threshold in use; the cache and the model run at this floor
+    floor = min(x for x in (args.person_threshold, args.ball_threshold, args.threshold) if x is not None)
+    meta = make_meta(args.video, max_frames, fps, args.weights, args.model, floor, class_list, sha)
+    court = load_court(args.court) if args.court else None
 
     cached = None
     model = None
@@ -318,20 +403,30 @@ def main() -> None:
 
     save_meta = None
     if args.save_detections is not None and cached is None:
-        save_path = cache_path(args.video, meta["weights_sha256"], args.model, args.threshold) if args.save_detections == "auto" else Path(args.save_detections)
+        save_path = cache_path(args.video, meta["weights_sha256"], args.model, floor) if args.save_detections == "auto" else Path(args.save_detections)
         save_meta = (save_path, meta)
 
     print(f"Tracker preset {preset_id}: {settings.name}")
-    summary = run(
-        args.video, out_video, out_csv, model, namer, args.threshold, args.max_seconds, args.show,
-        settings=settings, cached=cached, write_video=not args.no_video, save_cache_meta=save_meta,
-    )
+    try:
+        summary = run(
+            args.video, out_csv, model, namer, floor, args.max_seconds, args.show,
+            settings=settings, cached=cached, save_cache_meta=save_meta,
+            person_threshold=args.person_threshold if args.person_threshold is not None else args.threshold,
+            ball_threshold=args.ball_threshold if args.ball_threshold is not None else args.threshold,
+            rim_threshold=args.threshold, court=court, court_margin_px=args.court_margin_px,
+            allow_court_stem_mismatch=args.allow_court_stem_mismatch,
+        )
+    except ConfigError as e:  # only expected setup errors; other ValueErrors keep their traceback
+        raise SystemExit(str(e))
+    if not args.no_video:
+        print("Rendering video from the final CSV ...")
+        render_video(args.video, out_csv, out_video, summary["frames"])
 
     out_json = out_csv.with_name(f"{stem}_summary.json")
     out_json.write_text(json.dumps({"preset": preset_id, "tracker": settings.name, **summary}, indent=2))
 
     print(f"Processed {summary['frames']} frames at {summary['fps']:.3f} fps")
-    print(f"Unique player track IDs: {summary['unique_player_ids']}  (about 10 is ideal; far more = ID switches)")
+    print(f"Unique player track IDs: {summary['unique_player_ids']} by per-frame label, {summary['unique_player_ids_by_role']} by role vote  (about 10 is ideal)")
     print(f"Ball detected in {summary['ball_seen_pct']}% of frames")
     print(f"Tracker time: {summary['tracker_ms_per_frame']} ms/frame")
     if save_meta is not None:

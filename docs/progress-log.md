@@ -2,6 +2,28 @@
 
 Newest entries on top.
 
+## 2026-11-16
+*(session began 2026-11-15 and ran past midnight; tasks 002 and 003 below.)*
+
+**Task 003: the project's first real accuracy measurement.** A 10 s window of `data/raw/xbotgo.mp4` (original frames 307-546, every 6th frame = 40 labelled frames) was pre-filled from the A0 run, hand-corrected in CVAT, and exported to `data/ground_truth/xbotgo_10s_mot.txt` (289 boxes, 9 real players). `eval/score_tracking.py` scores it with motmetrics 1.4.0 (MIT).
+
+- **A0 scores IDF1 0.619 with 11 ID switches**, all 9 players mostly-tracked, against 17 tracker IDs used in that window. Everything before this was self-consistency, not accuracy. Source: `eval/reports/2026-11-15-idf1-a0-baseline.md`.
+- Two caveats that limit what the key can prove. **Recall (0.993) is circular**: the key was built from the tracker's own boxes, so it says nothing about detection. **Precision is biased downward and not neutral across thresholds** — unlabelled real players count as false positives, so a higher threshold flatters itself. Weight ID switches and MT/ML over precision.
+- The clip was chosen by measuring camera motion over all 719 frames: the camera pans at 8-11 s (4-5 px/frame) and is locked off at 15-21 s (0.00-0.01 px/frame). That same measurement gives the court filter its only valid range, frames 359-503.
+
+**Task 002: the premise did not hold here either.** Evidence: `eval/reports/2026-11-15-roles-thresholds.md`.
+
+- **The role vote is a relabelling only.** It changes no ID switches, no MT/ML and no tracker IDs on the answer key, and costs about 0.017 IDF1. It moves the player count 45 -> 43. The brief's premise (line 19) that flickering tracks "count twice and the player count is inflated" was wrong: a both-label track contributes one id. What was double-counted was the breakdown (45 players + 21 referees = 66 for 47 real tracks); the vote fixes that (43 + 4 = 47). **43 player tracks for 9 real players is still ~4.8x fragmentation, untouched.**
+- **Person threshold stays 0.4.** ID switches rise to 18 at 0.5 and 16 at 0.6 against 11 at 0.4, and at 0.6 two key players drop to partially tracked. Ball stays 0.4: the 0.25 floor lifts detection from 28.8% to 48.0%, but multi-candidate frames go 3 -> 31 and large centre-jumps between consecutive detections rise from 4.7% to 15.7%, so part of the gain may be spurious. **A few dozen hand-labelled ball positions would settle it, and that is the most valuable next measurement for shot detection.**
+- The grid cost one detection pass plus 5 replays instead of 27 runs, because the ball never reaches `tracker.update` and the vote is a post-process. The evaluator asserted that independence rather than assuming it: ball-varied runs have byte-identical player rows, person-varied runs identical ball rows.
+- **Court filter is code-complete and untested on real geometry.** `scripts/calibrate_court.py` exists and round-trips; the filter drops 37 of 1,565 person detections in frames 359-503. But the polygon used was a guessed trapezoid never checked against the court lines. Real calibration needs a human clicking frame 430.
+- The brief's ">1 s gap" merge-check threshold proved nearly vacuous (ByteTrack's buffer is ~1.25 s; largest observed gap 0.96 s, giving 0 reconnections). At 0.5 s it finds 12/14/19 at person 0.4/0.5/0.6. At 0.4 three look like merges (tracks 6, 15, 28); tracks 6 and 15 are long mixed-person tracks the vote labels "player" throughout, so `unique_player_ids_by_role` is not trustworthy at the margin.
+
+**Not done, and relevant to the commit:**
+- **The final review did not complete.** It cleared `scripts/calibrate_court.py` as privacy-clean, then stopped on a rate limit before reaching the `eval/score_tracking.py` changes and `eval/xbotgo_10s_frame_map.json`. Those remain unreviewed. The main session checked the scorer's IoU function numerically (7 hand-computed cases, correct orientation) and verified the replay gate reproduces byte-identically, but that is not a review pass.
+- Two open items flagged and not acted on: `data/ground_truth/xbotgo_10s_README.md` identifies nine minors by jersey number and clothing in a committable file; and `ultralytics-thop` (AGPL-3.0) and `ultralytics-platform` (AGPL-3.0-only) are installed in `.venv` as orphans, which `requirements.txt`'s planned `pip freeze` lock would pin into the manifest. CLAUDE.md forbids Ultralytics AGPL.
+- The A0 annotated video has still not been reviewed by hand for merged IDs.
+
 ## 2026-11-15
 **Task 001: ByteTrack vs BoT-SORT for player tracking (steps 1-4 done, review done, not committed)**
 
@@ -35,7 +57,7 @@ Lifetimes are given two ways. **Span** = first-to-last player-labelled frame, wh
 - Baseline: A0 reproduces 45 IDs / 28.8% ball, and its CSV is byte-identical to `runs/finetuned/xbotgo_tracks.csv`.
 - Long-lived IDs by presence: A0 and A1 have 21; every BoT-SORT preset has 15 to 19. By span, BoT-SORT has fewer long-lived IDs for all presets except B4 (24, equal to ByteTrack).
 - Winner as scored by the evaluator's rule (simplest preset within 10% of the fewest IDs): **A0**. A1 is nominally best (43) and is a one-parameter change; it is worth adopting only if the video shows no merged players.
-- Winner video for the student to watch: `runs/task001_eval_video/A0/xbotgo_tracked.mp4`.
+- Winner video, to be reviewed by hand: `runs/task001_eval_video/A0/xbotgo_tracked.mp4`.
 
 **Read of the results:**
 - **CMC: no consistent signal.** B0 vs B1 is the only pair that isolates CMC. Total IDs: 50 vs 49, within noise. Short-lived IDs: 14 to 15 by span, but 20 to 18 by presence. The two measures disagree in direction, so CMC did not measurably help on this clip.
@@ -58,13 +80,13 @@ Review of the fixed diff (reviewer, Opus, re-review complete):
 - Two SHOULD FIX items were found after the re-review and fixed: a replay hard-failed when the checkpoint was absent, and `--save-detections` help text was stale. Both were verified by the main session. A replay now works with `models/weights.pt` absent and still reproduces 45 IDs / 28.8%.
 - Verdict: no remaining blocking issues.
 
-Open decision (for the student and project manager):
+Open decision (not settled by the eval):
 - The code default is still `--tracker botsort` (B1, 49 IDs). The evaluator recommends against switching the default to BoT-SORT on this evidence, and the winner is A0. Changing the default is a code change for model-builder, not a docs change. The task brief's "BoT-SORT is the default" box is ticked as an implementation fact, with this caveat written next to it.
 
 Blockers and risks:
 - **No ground truth yet.** `data/ground_truth/` is empty. The eval measures tracker self-consistency only. No ID-switch rate, MOTA or IDF1 can be claimed.
 - One 30 s clip. Differences of a few IDs are noise.
-- The student has not yet read the diff, watched the A0 video for merged IDs, decided the default, or committed.
+- Still outstanding: the diff has not been read, the A0 video has not been reviewed for merged IDs, the default has not been decided, and nothing has been committed.
 
 Next steps:
 - Student: read the diff; watch `runs/task001_eval_video/A0/xbotgo_tracked.mp4` for merged IDs and for players labelled "referee"; decide the default preset (A0 vs A1 vs leaving BoT-SORT); commit.
@@ -74,7 +96,7 @@ Next steps:
 
 **Later on 2026-11-15: default tracker decided (resolves the open decision above).** The default is now ByteTrack preset A0 (task 002 Step 0). BoT-SORT and all presets stay selectable via `--tracker botsort` and `--preset`. The reason is evidence: BoT-SORT's tracker cost is about 17 to 19 times A0's per frame, with no consistent gain in IDs and fewer long-lived IDs by presence. CMC showed no signal (B0 vs B1).
 
-A1 (43 IDs, the only count below 45) was rejected after a manual merge check by the student, on the annotated video and crops, of A1's reconnections after gaps over 1 s (`runs/task001_eval/A1/xbotgo_tracks.csv`). Two of three are wrong merges: ID 28 joins a blue-jersey player (frame 666) to a different white-shirt player (frame 709), and ID 20 joins a white-jersey player (frame 500) to a spectator by the door (frame 538). ID 0 (frames 159 to 192) is probably correct. So A1's 43 is partly an artifact of merging different people. This is the failure mode the "fewer IDs is not automatically better" caveat in `eval/reports/2026-11-15-botsort-vs-bytetrack.md` predicted, and it is why task 002 makes a merge check a required part of its eval.
+A1 (43 IDs, the only count below 45) was rejected after a manual merge check, done by hand on the annotated video and crops, of A1's reconnections after gaps over 1 s (`runs/task001_eval/A1/xbotgo_tracks.csv`). Two of three are wrong merges: ID 28 joins a blue-jersey player (frame 666) to a different white-shirt player (frame 709), and ID 20 joins a white-jersey player (frame 500) to a spectator by the door (frame 538). ID 0 (frames 159 to 192) is probably correct. So A1's 43 is partly an artifact of merging different people. This is the failure mode the "fewer IDs is not automatically better" caveat in `eval/reports/2026-11-15-botsort-vs-bytetrack.md` predicted, and it is why task 002 makes a merge check a required part of its eval.
 
 ## 2026-11-14
 - Pivoted from ultimate frisbee to basketball (youth shot & stat tracking).

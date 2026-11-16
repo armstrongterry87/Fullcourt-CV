@@ -65,12 +65,16 @@ The eval for task 001 showed tracker choice is not the bottleneck. The real caus
 
 ## Done when
 
-- [ ] Step 0 done and task 001 committed by the student
-- [ ] Each track has exactly one role; no track is counted as both player and referee
-- [ ] Person and ball thresholds are separate options, with recommended defaults chosen from the grid
-- [ ] Court calibration tool and `--court` filter exist, are reviewed, and have a short honest test note
-- [ ] Eval report includes the merge check
-- [ ] Reviewer found no blocking issues; logs updated; student commits after reading the diff
+- [x] Step 0 done and task 001 committed. HEAD is `abbfbe4`, parent `a9144a9`. Both carry the same commit message but are different commits: `abbfbe4` holds Step 0 (ByteTrack A0 default, the merge check, the superseded box).
+- [x] Each track has exactly one role; no track is counted as both player and referee. `role_track` is constant per `track_id` (verified: 0 violations across 47 tracks).
+      **The premise at line 19 of this brief was wrong.** Flickering tracks did not count twice in the player total — a both-label track contributes one id. What was double-counted was the *breakdown*: 45 players + 21 referees = 66 for 47 real tracks. The vote fixes that (43 + 4 = 47) and moves the player count by only 2. **43 player tracks for 9 real players is still ~4.8x fragmentation, untouched by this change.**
+- [x] Person and ball thresholds are separate options, with recommended defaults chosen from the grid. **Recommended: person 0.4, ball 0.4** (both are the current defaults, inherited from `--threshold`).
+      Person 0.4 is the chosen default and the grid supports it: ID switches rise to 18 at 0.5 and 16 at 0.6 against 11 at 0.4, and at 0.6 two key players drop to partially tracked.
+      Ball stays 0.4 because 0.25 is **unproven**: it raises detection from 28.8% to 48.0%, but multi-candidate frames go 3 → 31 and large centre-jumps between consecutive detections rise from 4.7% to 15.7%, so some of the gain may be spurious. A few dozen hand-labelled ball positions would settle it. That is the most valuable next measurement for shot detection.
+- [~] Court calibration tool and `--court` filter: **code complete, untested on real geometry.** `scripts/calibrate_court.py` exists and round-trips through `save_court`/`load_court`, and the filter demonstrably drops rows (37 of 1,565 person detections in frames 359-503). But the polygon used was a guessed trapezoid never checked against the court lines, so the *tool* is demonstrated and the *calibration* is not. Valid frames on this clip are **359-503** (15-21 s, camera measured locked off at 0.00-0.01 px/frame; it pans at 8-11 s). Real calibration needs a human clicking frame 430.
+- [x] Eval report includes the merge check. Note the brief's required ">1 s gap" threshold proved **nearly vacuous**: ByteTrack's lost-track buffer is ~1.25 s and the largest observed reconnection gap was 0.96 s at person 0.4, giving 0 reconnections. Lowered to 0.5 s it finds 12 / 14 / 19 at person 0.4 / 0.5 / 0.6. At 0.4, three look like merges — tracks 6, 15 and 28 — and tracks 6 and 15 are long mixed-person tracks the vote labels "player" for their whole length, so `unique_player_ids_by_role` is not trustworthy at the margin.
+- [ ] Reviewer found no blocking issues; logs updated; commits after the diff is read.
+      **The final review did not complete.** It cleared `scripts/calibrate_court.py` as privacy-clean, then stopped on a rate limit before reaching the `eval/score_tracking.py` changes and `eval/xbotgo_10s_frame_map.json`. Those two remain unreviewed. See `docs/progress-log.md` for what was checked directly instead.
 
 ## Out of scope
 

@@ -16,3 +16,4 @@ streamlit
 jupyter
 
 # Pin exact versions once the pipeline works: pip freeze > requirements.lock.txt
+motmetrics==1.4.0    # MOT metrics for eval/score_tracking.py; MIT licence. NOTE: its iou_matrix breaks on NumPy 2 (np.asfarray removed); score_tracking.py uses its own IoU and only uses motmetrics for the accumulator/metrics
