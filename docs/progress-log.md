@@ -2,6 +2,61 @@
 
 Newest entries on top.
 
+## 2026-11-17
+*(unattended overnight run, began this morning and continued past midnight. Task 004. Nothing committed. Morning summary and all questions: `docs/tasks/004-questions.md`.)*
+
+**Task 004: shot scoring engine, built on synthetic tests only. No accuracy claim exists.**
+
+What got built:
+- Design doc `docs/design/004-shot-scoring.md`. Every court dimension carries a V/S/X/D/U status, and no value was filled in from memory.
+- `src/court/geometry.py`, `src/shots/trajectory.py`, `src/shots/detect.py`, `src/shots/config.py`, `scripts/detect_shots.py`.
+- `scripts/label_shots.py`, a hand-labelling tool (open, step, label, save). Its arrow keys were tested only through mocks.
+- `eval/score_shots.py`, which scores predicted shots against a label CSV within ±1 s.
+- 98 tests reported passing (`.venv/Scripts/pytest.exe tests/ -q`), up from 84 after the step 5 fixes. The docs agent did not re-run them. No new dependencies, no scipy (Q1), and nothing writes an image.
+
+Results:
+- **Nothing has been validated on video (Q3).** All acceptance is synthetic. The XbotGo clip is not a test case for any scoring rule.
+- `scripts/detect_shots.py` on the XbotGo clip emits zero attempts, with `n_flights_lost=1`. This is the correct outcome. The clip ends with the ball still airborne, and the engine declined to guess.
+
+Court dimensions:
+- FIBA moved to V from the FIBA 2024 Official Basketball Rules (Art. 2.1, 2.4.3, 2.4.5).
+- NFHS moved to S. The source is NFHS Rule 1 quoted verbatim, with section numbers, in a secondary gymnasium-equipment design guide.
+- The 63 in (5.25 ft) basket offset is confirmed two independent ways for NFHS: the equipment chain (48 + 6 + 9 in) and the three-point straight segments meeting the arc at the basket's offset. This sets the origin of every 2/3 call.
+- NCAA and NBA stay `verified = False` (Q12, Q20, Q22). NCAA's basket offset is an assumption that it matches NFHS.
+- Method: the research step's failed fetches had saved their PDFs anyway. The main session extracted text from them with the local `pdftotext`. The research agent has no shell and could not do this itself.
+
+Step 5 review (reviewer, Opus): no blocking issues. Three fixes closed paths to confidently wrong output:
+- Miss-after-loss is capped at 0.6 and needs real detections on both sides.
+- Rim labels are checked against the homography. Before this, mirrored court coordinates could publish at 0.9 confidence.
+- `provisional_geometry` caps `points_conf` at 0.6 for NCAA and NBA. Before this, their unverified constants reached the CSV at 0.9.
+- The reviewer also reported 6 SHOULD FIX and 6 NIT items. Their status is not recorded in the run's notes.
+
+Decisions made without a person (all in `docs/tasks/004-questions.md`):
+- **Q5: `points` is the shot value** (1, 2 or 3) on every row, misses included. Points scored is derived. Three deliverables depend on this, so it needs confirmation.
+- **Q15: shooter feet at take-off, not release.** A deliberate deviation from the brief. Airborne feet map too far from the camera.
+- **Q13: a label marks the outcome frame**, not the release frame.
+- **Q27 (scorer): drop-and-count with a loud banner and exit code 2**, rather than a hard fail. A clean file prints one quiet line.
+- The second block numbered Q27 (the step 5 fixes) is renumbered Q28.
+
+Licence finding: `roboflow/sports` is MIT, but its soccer example imports Ultralytics (AGPL-3.0). Library modules were not checked. Nothing was copied. `aarnavshah12/shot-tracker` has no licence file and must not be copied from.
+
+Housekeeping: a stray synthetic label file, `data/labels/selftest_xbotgo_shots.csv`, was deleted (Q11). It held test rows, not labels.
+
+**Not done, and relevant to the commit:**
+- **Step 6 (architect post-build review) is not confirmed.** Design section 10 is still the placeholder "To be filled in at step 6." Treat the task as not fully closed.
+- The keyboard check of the labelling tool's arrow keys (Q10) has not happened.
+- The court polygon in `data/courts/xbotgo.json` is a guessed trapezoid, not a calibration.
+- Hand-labelling of shots on the XbotGo clip has not started. The task's "works on `data/raw/xbotgo.mp4`" box is open.
+- Nothing is committed.
+
+Next steps:
+- Student: run `scripts/label_shots.py` in a real window and check the arrow keys.
+- Student: calibrate the court on frame 430.
+- Student: confirm Q5 and Q15. Close NCAA and NBA from the design doc section 5 list (about 10 minutes), or accept them as provisional.
+- Confirm whether step 6 runs, then review the diff and commit by hand.
+- Decide whether shot labels stay in `data/labels/` or move to `data/ground_truth/` (Q14).
+- Once shots are hand-labelled, score them with `eval/score_shots.py`. Only then is there an accuracy number, and it needs a citation to its report.
+
 ## 2026-11-16
 *(session began 2026-11-15 and ran past midnight; tasks 002 and 003 below.)*
 
