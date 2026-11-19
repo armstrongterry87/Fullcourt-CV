@@ -16,12 +16,17 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 
+from src.camera.motion import stretch_at, transform_points
 from src.court.polygon import ConfigError
 from src.shots.config import ShotConfig
+
+if TYPE_CHECKING:
+    from src.camera.motion import MotionTrack
 
 FT_PER_M = 1.0 / 0.3048  # 1 ft = 0.3048 m (international foot). The only metre->feet conversion.
 DEFAULT_LEVEL = "nfhs"
@@ -193,11 +198,15 @@ def to_rim_frame(xy_ft: np.ndarray, rim_id: str, court_length_ft: float | None) 
 
 @dataclass(frozen=True)
 class Rim:
-    """A rim box in pixels. `box_px` = (x1, y1, x2, y2); `source` is 'manual' or 'median'."""
+    """A rim box in pixels. `box_px` = (x1, y1, x2, y2); `source` is 'manual' or 'median'.
+
+    `view` is the motion-compensation view (mosaic canvas) whose pixels `box_px` is in; 0 for a static camera.
+    """
 
     id: str
     box_px: tuple[float, float, float, float]
     source: str
+    view: int = 0
 
     @property
     def w_px(self) -> float:
@@ -232,6 +241,10 @@ class Calibration:
     camera_static: bool
     frame_width: int | None
     frame_height: int | None
+    # design 005: set when the court was calibrated on a mosaic (camera_static is then false). For such a
+    # calibration `homography.H_px_to_ft` holds H_ref_to_ft (reference pixels to feet), not raw pixels.
+    motion_id: str | None = None
+    camera_static_explicit: bool = True  # False when the JSON had no camera_static key (assumed static)
 
     def spec(self) -> CourtSpec:
         return get_spec(self.level)
@@ -241,8 +254,20 @@ class Calibration:
         return self.court_length_ft if self.court_length_ft is not None else self.spec().court_length_ft.value
 
 
-def load_calibration(path: Path, cfg: ShotConfig | None = None) -> Calibration:
-    """Read the shot-engine keys from the court JSON (same file `load_court` reads)."""
+def check_motion_id(calib: Calibration, motion: "MotionTrack") -> None:
+    """Raise ConfigError unless the calibration was clicked on the mosaic of THIS motion file."""
+    if calib.motion_id is None or calib.motion_id != motion.motion_id:
+        raise ConfigError(f"The calibration's motion_id ({calib.motion_id!r}) does not match the motion file "
+                          f"({motion.motion_id!r}): recalibrate on the current mosaic "
+                          f"(scripts/calibrate_court.py --mosaic).")
+
+
+def load_calibration(path: Path, cfg: ShotConfig | None = None, motion: "MotionTrack | None" = None) -> Calibration:
+    """Read the shot-engine keys from the court JSON (same file `load_court` reads).
+
+    With `motion` and `camera_static: false`, landmark points are in view (mosaic) pixels: each is mapped to
+    reference pixels and ONE `H_ref_to_ft` is fitted. A landmark too stretched in the reference is rejected.
+    """
     path = Path(path)
     try:
         d = json.loads(path.read_text())
@@ -252,6 +277,10 @@ def load_calibration(path: Path, cfg: ShotConfig | None = None) -> Calibration:
     get_spec(level)
     hp = d.get("homography_points")
     hom = None
+    static = bool(d.get("camera_static", True))
+    mapped = motion is not None and not static
+    if mapped:
+        check_motion_id(Calibration(level, None, None, None, (), static, None, None, d.get("motion_id")), motion)
     if hp:
         try:
             px = np.array([p["px"] for p in hp], dtype=np.float64)
@@ -260,20 +289,38 @@ def load_calibration(path: Path, cfg: ShotConfig | None = None) -> Calibration:
             raise ConfigError(f"{path}: each homography point needs 'px' and 'ft' ({e}).") from e
         if px.ndim != 2 or px.shape[1] != 2 or ft.shape != px.shape:
             raise ConfigError(f"{path}: homography 'px' and 'ft' must be [x, y] pairs.")
+        if mapped:
+            px = _view_to_ref(px, [int(p.get("view", 0)) for p in hp], motion, path)
         hom = fit_homography(px, ft, cfg)
     rims = []
     for r in d.get("rims") or []:
         box = r.get("box_px")
         if r.get("id") not in ("A", "B") or not box or len(box) != 4 or box[2] <= box[0] or box[3] <= box[1]:
             raise ConfigError(f"{path}: a rim needs id 'A' or 'B' and box_px [x1, y1, x2, y2] with x2>x1, y2>y1.")
-        rims.append(Rim(r["id"], tuple(float(v) for v in box), str(r.get("source", "manual"))))
+        rims.append(Rim(r["id"], tuple(float(v) for v in box), str(r.get("source", "manual")), int(r.get("view", 0))))
     length = d.get("court_length_ft")
     radius = d.get("three_point_radius_ft")
     return Calibration(
         level, None if length is None else float(length), None if radius is None else float(radius),
-        hom, tuple(rims), bool(d.get("camera_static", True)),
-        d.get("frame_width"), d.get("frame_height"),
+        hom, tuple(rims), static,
+        d.get("frame_width"), d.get("frame_height"), d.get("motion_id"), "camera_static" in d,
     )
+
+
+def _view_to_ref(px_view: np.ndarray, views: list[int], motion: "MotionTrack", path: Path) -> np.ndarray:
+    """Map landmark pixels clicked on mosaic views to reference pixels; reject over-stretched landmarks."""
+    out = np.zeros_like(px_view)
+    limit = float(motion.meta.get("settings", {}).get("calib_max_stretch", 4.0))
+    for i, (p, v) in enumerate(zip(px_view, views)):
+        if not (0 <= v < len(motion.views)):
+            raise ConfigError(f"{path}: landmark {i} is on view {v}, but the motion file has {len(motion.views)} views.")
+        H_view_to_ref = np.linalg.inv(motion.views[v].H_ref_to_view)
+        s = stretch_at(H_view_to_ref, (float(p[0]), float(p[1])))
+        if not (s <= limit):
+            raise ConfigError(f"{path}: landmark {i} (view {v}) is stretched {s:.1f}x in the reference (limit {limit}); "
+                              f"pick a landmark nearer the centre of its mosaic.")
+        out[i] = transform_points(H_view_to_ref, p[None])[0]
+    return out
 
 
 # --------------------------------------------------------------------------- two or three

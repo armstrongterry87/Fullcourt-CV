@@ -2,6 +2,70 @@
 
 Newest entries on top.
 
+## 2026-11-18
+*(unattended run, Task 005 Part A. Nothing committed. Morning summary and all questions: `docs/tasks/005-questions.md`. Physical checks: `eval/reports/2026-11-18-motion-compensation.md`.)*
+
+**Task 005 Part A: camera motion compensation built and checked on one 30 s clip. It works at the frame centre and misses four design targets. Part B has not started.**
+
+What got built:
+- Design: `docs/design/005-motion-compensation.md`, written by the architect agent (Fable). An Opus stand-in design is kept beside it as `005-motion-compensation-opus-standin.md`. See the A1 notes in the questions file.
+- Build: `src/camera/motion.py` (per-frame homographies, keyframe graph, views, quality, cache), `scripts/stabilize.py`, a mosaic mode in `scripts/calibrate_court.py`, `--motion` in `scripts/detect_shots.py` and `src/shots/detect.py`, `src/court/geometry.py`, and `tests/test_motion.py`. `ALGO_VERSION` is 3.
+- Eval: `eval/motion_checks.py`, `eval/motion_frames.py`, `eval/motion_adjacent.py`, and the A3 report.
+- Tests: 128 passed (98 existing, 30 new). These counts come from run notes given to the report-writer. The report-writer has no shell and did not re-run them.
+- Review: the reviewer (Opus) found no blocking issues and 3 should-fix items. All three were fixed: a cap on chained rescue keyframes, recovery in pass 2, and a check that the motion file's fps and frame count match the video. A2-Q10 also records a pass-1 stale-pose fix and a jump-check skip after long gaps.
+
+Results (A3, one clip: `data/raw/xbotgo.mp4`, 719 frames, 23.951 fps; all numbers from the A3 report):
+
+| Check | Raw | Stabilised | Target | Result |
+|---|---|---|---|---|
+| Frame-centre pose vs direct fit | n/a | median 0.52 px, p95 1.42 px | n/a | sound at centre |
+| Independent drift, max corner (190 pairs) | n/a | median 3.78 px, p95 10.5 px | median <= 2, p95 <= 5 | miss |
+| Independent drift, mean corner | n/a | median 2.07 px, p95 5.68 px | same | narrow miss |
+| Coverage | n/a | 99.86% at >= 0.6; 30.0% at 0.9; longest unreliable run 1 frame | >= 95%; <= 1 s | pass |
+| Left rim (view 0), p95 spread | 23.4 px | 7.8 view px (about 3 raw-equivalent px) | <= 25% of raw; <= 0.5 W | 0.33 of raw: miss on ratio, pass on absolute |
+| Right rim (view 1), p95 spread | 1.9 px | 2.0 px | same | no power (raw already tight) |
+| Static person, track 34 (n = 209), p95 | 110.6 px | 9.7 view px | <= 15 px | pass (one person) |
+| Bench seat A, full gate (n = 114), p95 | 41.1 px | 32.7 px | <= 15 px | fail |
+| On-court controls (tracks 6, 19) | n/a | do not look static | must not look static | pass |
+| Closure error | n/a | not measured (graph is a tree, no loops) | <= 5 px | cannot assess |
+
+Structure: 4 keyframes (frames 0, 207, 237, 274), 2 views, anchor keyframe 1, max 2 hops. Keyframe 3 hangs on a 20-frame chained edge, so 430 frames (60% of the clip) are capped at 0.6. The left rim is stretched 2.65x in view 0.
+
+Decisions made, and why:
+- **Frames are matched to keyframes, not to each other.** Chaining frame to frame would add error on every step. Re-anchoring reuses old keyframes when the camera returns to a view.
+- **Two views, not one mosaic.** A flat canvas stretches content without limit as the pan grows. Each view is bounded at 1.5x stretch around its keyframe (an untuned value). A narrow pan still gives one view, as the brief expects. This clip gives two.
+- **Rescue mode in pass 1 (not in the design).** The fast pan blurred every 5 Hz sample, so none matched the first keyframe well enough to start a new one. The builder chains frames until a sharp frame can start a keyframe (A2-Q1). The cost is chained edges with accumulated error. This is the biggest weakness the A3 checks found.
+- **Every detection is masked, rims included** (design Q8). This avoids mapping class ids to names. It costs only the small rim box.
+- **Static-people picks.** Picks were made by eye before the stabilised numbers were read. Two exceptions, both disclosed in the report: track 35 was a bad pick, and the bench-A subset (frames 372-590) was chosen after the full result was seen. The full-gate number is the one reported as the verdict.
+- **Stand-in probe numbers kept as leads only** (pan about 88 degrees, focal about 920 px). A3 agrees with the pan (frame centres sweep about 85 degrees). The rim bearings in the A3 report depend on an assumed focal length of 800 to 1050 px, so they are not measured.
+
+Blockers and risks:
+- 30 s, one clip. It says nothing about drift over a full game.
+- The chained edge to keyframe 3 caps 60% of the clip at 0.6 and adds corner error.
+- Quality 0.6 is permissive. Single-frame corner jumps of 19 to 47 px (frames 221-250 and 615-616) still score 0.6.
+- Rim detections exist only while the camera is still, so rim stability cannot show whether stabilisation works during a pan.
+- Interactive mosaic clicking in a real window has not been tested (A2-Q3).
+- Undecided: rims clicked on the mosaic (design) or on raw keyframes (stand-in proposal).
+- Footage of minors: the mosaic (`data/frames/xbotgo_mosaic.jpg`) and debug video (`runs/`) show bystanders. Design 12.2 says both folders are git-ignored. `*.jpg` is not ignored globally, so the scripts must refuse other output folders. I did not re-check `.gitignore`.
+
+Next steps:
+- Owner: decide the four items in the morning summary (doc handling, whether to fix the A3 findings before Part B, a real-window click test of the mosaic mode, and mosaic vs raw rim clicks).
+- Owner: watch `runs/xbotgo_motion_debug.mp4` yourself. The agent's visual check used extracted frames and montages.
+- Owner: review the diff and commit by hand. Nothing is committed.
+- Part B waits for `data/raw/game1.mp4` and hand-labelled shots.
+
+How the system works (plain English, for the student to defend):
+1. The camera rotates on a tripod, so each frame is the same gym seen from a slightly different direction. Two images from a camera that only rotates (fixed zoom) are related by a homography: a 3x3 matrix with 8 free numbers that maps every pixel of one image to the other. It is exact for pure rotation. It breaks if the camera zooms or moves position (parallax).
+2. For each frame we need one matrix that maps the frame into a single fixed picture, the reference. We estimate it from background features only. SIFT finds keypoints and descriptors. They are matched to a keyframe's keypoints with a ratio test (Lowe 0.75) and a mutual check. RANSAC then fits one homography and keeps the inliers. The fit uses a fixed seed, so reruns match.
+3. Players and the ball are masked out before features are found. The masks come from the same frame's detections, dilated, so moving people do not vote for their own motion.
+4. We do not chain frame to frame, because errors add up. Keyframes (sampled about 5 times a second) are matched to each other, and each frame is matched to a keyframe. When the camera returns to a view, the old keyframes are reused. This closes the loop without any global optimisation.
+5. Chaining is the fallback for frames too blurred to match a keyframe, usually during a fast pan. A chained frame carries the error of every link, so it is capped at quality 0.6.
+6. The reference is the keyframe with the fewest hops to all the others. Composition: the rightmost matrix is applied first, so `H_frame_to_ref = H_key_to_ref @ H_frame_to_key`.
+7. A flat canvas stretches content as the pan angle grows (1.5x at 35 degrees, 2.4x at 50). The reference is therefore split into views. Each view is a keyframe's plane extended to a canvas, with stretch bounded at 1.5x. Each rim is scored in its own view.
+8. Quality per frame: 0.9 (direct match, enough inliers, low error, inliers spread across the frame), 0.6 (everything else, including chained frames), or 0 (unreliable, with the pose set to NaN so no code can use it by accident). Shots that depend on unreliable frames become `unknown`. They are never guessed.
+9. Scoring: the shot engine is unchanged. Feet and ball centres are transformed to view pixels. Box corners are not transformed, because a box's corners do not map to a box. The rebuilt box is a centre-and-width model. The court is clicked once on the mosaic and fitted to feet in feet.
+10. What the checks can and cannot show: nothing measures camera pose directly. The A3 checks are consistency checks (a rim should not move, seated people should not move, consecutive frames should agree with a direct fit). They do not measure shot accuracy. The drift check uses the same SIFT and RANSAC code as the build, so a systematic error common to both would not show. The scoreboard landmark is the only independent check.
+
 ## 2026-11-17
 *(unattended overnight run, began this morning and continued past midnight. Task 004. Nothing committed. Morning summary and all questions: `docs/tasks/004-questions.md`.)*
 

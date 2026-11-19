@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import math
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -23,8 +24,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.camera.motion import MotionTrack, transform_tracks
 from src.court.geometry import (
-    Calibration, Rim, feet_off_court, is_three, px_to_ft, three_margin_ft, to_rim_frame,
+    Calibration, Rim, check_motion_id, feet_off_court, is_three, px_to_ft, three_margin_ft, to_rim_frame,
 )
 from src.court.polygon import ConfigError
 from src.shots.config import ShotConfig
@@ -32,6 +34,11 @@ from src.shots.trajectory import Trajectory, clean_ball_track
 
 __all__ = ["COLUMNS", "ShotConfig", "ShotRow", "DetectionResult", "Outcome", "detect_shots",
            "judge_outcome", "estimate_rims", "infer_fps", "read_tracks", "write_shots_csv"]
+
+MOTION_COLUMNS = ["view_id", "camera_quality"]  # appended only when stabilised scoring was used (design 005 sec. 9.3)
+_DRIFT_WINDOW_S = 10.0   # CHOSEN: window for the stabilised rim-drift check (design 005 sec. 9.3)
+_DRIFT_MIN_DETS = 10     # CHOSEN: fewest rim detections for a window to be judged
+_DRIFT_NEAR_W = 2.0      # rim detections farther than this many W from the calibrated rim are other objects
 
 COLUMNS = [
     "frame", "time_s", "result", "points", "notes",
@@ -69,6 +76,8 @@ class ShotRow:
     shooter_conf: float
     points_conf: float
     shot_id: int = -1
+    view_id: int | None = None           # stabilised scoring only
+    camera_quality: float | None = None  # lowest motion quality between release and outcome
 
 
 @dataclass
@@ -168,6 +177,23 @@ def _drifted(rim: Rim, rim_dets: pd.DataFrame, frame_width_px: float, cfg: ShotC
     mx = float(((d["x1_px"] + d["x2_px"]) / 2).median())
     my = float(((d["y1_px"] + d["y2_px"]) / 2).median())
     return math.hypot(mx - rim.cx_px, my - rim.cy_px) > cfg.rim_drift_w * rim.w_px
+
+
+def _drifted_windows(rim: Rim, rim_dets: pd.DataFrame, fps: float, cfg: ShotConfig) -> set[int]:
+    """Windows (10 s each) whose median detected rim centre is > `rim_drift_w` W from the calibrated one."""
+    if rim_dets.empty:
+        return set()
+    cx = ((rim_dets["x1_px"] + rim_dets["x2_px"]) / 2).to_numpy()
+    cy = ((rim_dets["y1_px"] + rim_dets["y2_px"]) / 2).to_numpy()
+    d = np.hypot(cx - rim.cx_px, cy - rim.cy_px)
+    near = d <= _DRIFT_NEAR_W * rim.w_px
+    win = (rim_dets["frame"].to_numpy() / fps // _DRIFT_WINDOW_S).astype(int)
+    out = set()
+    for w in np.unique(win[near]):
+        sel = near & (win == w)
+        if sel.sum() >= _DRIFT_MIN_DETS and float(np.median(d[sel])) > cfg.rim_drift_w * rim.w_px:
+            out.add(int(w))
+    return out
 
 
 # --------------------------------------------------------------------------- helpers
@@ -313,9 +339,10 @@ def judge_outcome(tr: Trajectory, held: np.ndarray, zone_start: int, rim: Rim, c
 
 # --------------------------------------------------------------------------- main entry
 
-def detect_shots(tracks: pd.DataFrame, calib: Calibration, fps: float, cfg: ShotConfig | None = None,
-                 frame_height_px: float | None = None) -> DetectionResult:
-    """Detect attempts and score them. `fps` is the video's frame rate (never assumed)."""
+def _detect_core(tracks: pd.DataFrame, calib: Calibration, fps: float, cfg: ShotConfig | None = None,
+                 frame_height_px: float | None = None, feet_cut: set[tuple[int, int]] | None = None,
+                 stabilised: bool = False) -> DetectionResult:
+    """The static-camera engine. With `stabilised` the tracks are already in view pixels."""
     cfg = cfg or ShotConfig()
     debug: dict = {"fps": fps, "n_flights": 0, "n_flights_lost": 0, "n_lockout_suppressed": 0,
                    "n_attempts": 0, "warnings": []}
@@ -328,7 +355,18 @@ def detect_shots(tracks: pd.DataFrame, calib: Calibration, fps: float, cfg: Shot
     rim_dets = tracks[cls == "rim"]
     rims = list(calib.rims)
     drift: set[str] = set()
-    if not rims:
+    drift_win: dict[str, set[int]] = {}
+    if stabilised:
+        # design 005 9.3: rims must be manual; drift is judged per 10 s window on stabilised detections
+        if not rims:
+            raise ConfigError("Stabilised scoring needs manual rims in the calibration file.")
+        _check_rim_labels(rims, calib)
+        for r in rims:
+            drift_win[r.id] = _drifted_windows(r, rim_dets, fps, cfg)
+            if drift_win[r.id]:
+                debug["warnings"].append(f"rim {r.id}: stabilised rim detections drifted > {cfg.rim_drift_w} W "
+                                         f"in windows {sorted(drift_win[r.id])}")
+    elif not rims:
         rims = estimate_rims(rim_dets, frame_w, cfg)
         if rims and calib.homography is not None:
             # median labels (left=A, right=B) are arbitrary; the homography fixes which rim is A
@@ -440,14 +478,14 @@ def detect_shots(tracks: pd.DataFrame, calib: Calibration, fps: float, cfg: Shot
         else:
             release_conf = 0.9
         result_conf = out.conf
-        if rim.id in drift:
+        if rim.id in drift or int(release_frame / fps // _DRIFT_WINDOW_S) in drift_win.get(rim.id, ()):
             notes.append("rim_drift")
             result_conf = min(result_conf, cfg.rim_drift_conf_cap)
 
         held_ball = {int(tr.frame[k]): (float(tr.x_px[k]), float(tr.y_px[k]))
                      for k in range(r_idx, -1, -1) if held[k] and tr.frame[k] >= release_frame - sec(cfg.shooter_vote_s)}
         row = _shooter_and_points(release_frame, held_ball, players, by_id, calib, rim, fps, cfg,
-                                  frame_height_px, notes)
+                                  frame_height_px, notes, feet_cut)
         row.update(frame=out.frame, time_s=out.frame / fps, result=out.result, release_frame=release_frame,
                    release_time_s=release_frame / fps, ball_release_x_px=float(tr.x_px[r_idx]),
                    ball_release_y_px=float(tr.y_px[r_idx]), rim_id=rim.id, level=calib.level,
@@ -461,11 +499,119 @@ def detect_shots(tracks: pd.DataFrame, calib: Calibration, fps: float, cfg: Shot
     return DetectionResult(rows, debug)
 
 
+def detect_shots(tracks: pd.DataFrame, calib: Calibration, fps: float, cfg: ShotConfig | None = None,
+                 frame_height_px: float | None = None, motion: MotionTrack | None = None,
+                 feet_cut: set[tuple[int, int]] | None = None) -> DetectionResult:
+    """Detect attempts and score them. `fps` is the video's frame rate (never assumed).
+
+    `camera_static` and `motion` decide the path (design 005 section 10):
+      - no motion file, static camera: the original engine, unchanged
+      - no motion file, camera_static false: ConfigError (run scripts/stabilize.py)
+      - static camera, motion measured static: the original engine (identity transform)
+      - static camera, motion measured moving: original engine, warning, confidences capped at 0.3
+      - camera_static false with a motion file whose id matches the calibration: stabilised scoring
+    """
+    cfg = cfg or ShotConfig()
+    if motion is not None:
+        if abs(float(motion.meta["fps"]) - fps) > 1e-3:
+            raise ConfigError(f"The motion file was made at {motion.meta['fps']} fps but shots are scored at {fps} fps: "
+                              f"it belongs to a different video or frame rate.")
+        if len(tracks) and int(tracks["frame"].max()) >= motion.n_frames:
+            raise ConfigError(f"The tracks reach frame {int(tracks['frame'].max())} but the motion file covers only "
+                              f"{motion.n_frames} frames (0-{motion.n_frames - 1}); re-run scripts/stabilize.py "
+                              f"on the same clip.")
+    if motion is None:
+        if not calib.camera_static:
+            raise ConfigError("The calibration says camera_static is false (a panning camera), so a motion file is "
+                              "required: run scripts/stabilize.py on the video and pass --motion.")
+        return _detect_core(tracks, calib, fps, cfg, frame_height_px, feet_cut)
+    if calib.camera_static:
+        res = _detect_core(tracks, calib, fps, cfg, frame_height_px, feet_cut)
+        if not motion.is_static:
+            msg = ("the calibration says camera_static but the motion file shows the camera MOVED; the rim box and "
+                   "court homography are wrong on most frames. Results are capped at confidence 0.3. Recalibrate "
+                   "on the mosaic (scripts/calibrate_court.py --mosaic).")
+            print(f"WARNING: {msg}", file=sys.stderr)
+            res.debug["warnings"].append(msg)
+            for r in res.shots:
+                r.notes.append("camera_moved")
+                r.result_conf = min(r.result_conf, 0.3)
+                r.points_conf = min(r.points_conf, 0.3)
+        return res
+    check_motion_id(calib, motion)
+    return _detect_stabilised(tracks, calib, fps, cfg, frame_height_px, motion, feet_cut)
+
+
+def _zero_runs(q: np.ndarray) -> list[tuple[int, int]]:
+    """Inclusive (start, end) frame runs where quality is 0."""
+    z = np.concatenate([[False], q <= 0, [False]]).astype(np.int8)
+    d = np.diff(z)
+    return list(zip(np.flatnonzero(d == 1).tolist(), (np.flatnonzero(d == -1) - 1).tolist()))
+
+
+def _detect_stabilised(tracks: pd.DataFrame, calib: Calibration, fps: float, cfg: ShotConfig,
+                       frame_height_px: float | None, motion: MotionTrack,
+                       feet_cut: set[tuple[int, int]] | None) -> DetectionResult:
+    """Run the engine once per view that holds a rim, on tracks moved into that view (design 005 9.3)."""
+    fh = frame_height_px or calib.frame_height or motion.meta.get("frame_height")
+    if feet_cut is None:  # computed in RAW pixels, before any transform
+        people = tracks[~tracks["class"].isin(["ball", "rim"])]
+        cut = people["y2_px"] >= (fh - cfg.feet_edge_px) if fh else people["y2_px"] < -1
+        feet_cut = {(int(t), int(f)) for t, f in zip(people.loc[cut, "track_id"], people.loc[cut, "frame"])}
+    if not calib.rims:
+        raise ConfigError("Stabilised scoring needs manual rims (clicked on the mosaic) in the calibration file.")
+    gap_n = max(1, round(cfg.max_gap_s * fps))
+    q_all = motion.quality
+    debug: dict = {"fps": fps, "n_flights": 0, "n_flights_lost": 0, "n_lockout_suppressed": 0, "n_attempts": 0,
+                   "warnings": [], "n_ball_detections": 0, "n_trajectory_points": 0, "n_segments": 0, "rims": [],
+                   "coordinate_space": "view", "n_views": len({r.view for r in calib.rims}),
+                   "n_unreliable_frames": int((q_all <= 0).sum()),
+                   "n_unreliable_runs_over_gap": sum(1 for a, b in _zero_runs(q_all) if b - a + 1 > gap_n),
+                   "max_closure_err_px": float(motion.meta.get("max_closure_err_px", 0.0))}
+    rows: list[ShotRow] = []
+    for v in sorted({r.view for r in calib.rims}):
+        if v >= len(motion.views):
+            raise ConfigError(f"A rim is assigned to view {v}, but the motion file has {len(motion.views)} views.")
+        hom = calib.homography
+        if hom is not None:  # `hom.H_px_to_ft` holds H_ref_to_ft for a mosaic calibration
+            H_view_to_ft = hom.H_px_to_ft @ np.linalg.inv(motion.views[v].H_ref_to_view)
+            hom = replace(hom, H_px_to_ft=H_view_to_ft)
+        calib_v = replace(calib, rims=tuple(r for r in calib.rims if r.view == v), homography=hom)
+        res = _detect_core(transform_tracks(tracks, motion, v), calib_v, fps, cfg, None, feet_cut, stabilised=True)
+        q_v = motion.view_quality(v)
+        runs_over = [(a, b) for a, b in _zero_runs(q_v) if b - a + 1 > gap_n]
+        take = max(1, round(cfg.takeoff_window_s * fps))
+        for r in res.shots:
+            lo, hi = r.release_frame, max(r.frame, r.release_frame)
+            span = q_v[lo:hi + 1]
+            r.view_id = v
+            r.camera_quality = float(span.min()) if len(span) else 0.0
+            if any(a <= hi and b >= lo for a, b in runs_over):
+                r.result, r.result_conf = "unknown", 0.0
+                r.notes.append("camera_unreliable")
+            elif len(span) and span.min() < 0.9:
+                r.result_conf = min(r.result_conf, 0.6)
+                r.points_conf = min(r.points_conf, 0.6)
+                r.notes.append("camera_degraded")
+            if "no_shooter" in r.notes and (q_v[max(0, lo - take):lo + 1] <= 0).any():
+                r.notes.append("camera_unreliable")
+        rows.extend(res.shots)
+        for k in ("n_flights", "n_flights_lost", "n_lockout_suppressed", "n_attempts", "n_ball_detections",
+                  "n_trajectory_points", "n_segments"):
+            debug[k] += res.debug.get(k, 0)
+        debug["warnings"] += res.debug["warnings"]
+        debug["rims"] += res.debug.get("rims", [])
+    rows.sort(key=lambda r: (r.frame, r.release_frame))
+    for k, r in enumerate(rows):
+        r.shot_id = k
+    return DetectionResult(rows, debug)
+
+
 # --------------------------------------------------------------------------- shooter, feet, points
 
 def _shooter_and_points(release_frame: int, held_ball: dict, players: dict, by_id: dict, calib: Calibration,
                         rim: Rim, fps: float, cfg: ShotConfig, frame_height_px: float | None,
-                        notes: list[str]) -> dict:
+                        notes: list[str], feet_cut: set[tuple[int, int]] | None = None) -> dict:
     """Shooter vote (4.5), feet at take-off, and the shot value (4.6, 4.7). Returns ShotRow kwargs."""
     res = dict(shooter_track_id=None, feet_x_px=None, feet_y_px=None, feet_x_ft=None, feet_y_ft=None,
                margin_ft=None, shooter_conf=0.0, points=None, points_conf=0.0)
@@ -487,7 +633,10 @@ def _shooter_and_points(release_frame: int, held_ball: dict, players: dict, by_i
     f_off, box = max(cand, key=lambda fb: (fb[1][3], fb[0]))
     feet_px = ((box[0] + box[2]) / 2, box[3])
     res.update(feet_x_px=feet_px[0], feet_y_px=feet_px[1])
-    if frame_height_px is not None and box[3] >= frame_height_px - cfg.feet_edge_px:
+    # feet_cut (stabilised scoring) was computed from RAW pixels before the transform; otherwise test the box here
+    cut = ((tid, f_off) in feet_cut) if feet_cut is not None else (
+        frame_height_px is not None and box[3] >= frame_height_px - cfg.feet_edge_px)
+    if cut:
         notes.append("feet_cut_off")
         return res
     if calib.homography is None:
@@ -619,7 +768,8 @@ def write_shots_csv(result: DetectionResult, path: Path) -> None:
 
     with path.open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(COLUMNS)
+        extra = result.debug.get("coordinate_space") == "view"  # stabilised scoring: two columns at the end
+        w.writerow(COLUMNS + (MOTION_COLUMNS if extra else []))
         for r in result.shots:
             w.writerow([
                 r.frame, f"{r.time_s:.3f}", r.result, "" if r.points is None else r.points,
@@ -629,4 +779,4 @@ def write_shots_csv(result: DetectionResult, path: Path) -> None:
                 cell(r.feet_x_ft, 2), cell(r.feet_y_ft, 2),
                 r.rim_id, r.level, cell(r.margin_ft, 2),
                 r.attempt_conf, r.release_conf, r.result_conf, r.shooter_conf, r.points_conf,
-            ])
+            ] + ([r.view_id, cell(r.camera_quality, 2)] if extra else []))
